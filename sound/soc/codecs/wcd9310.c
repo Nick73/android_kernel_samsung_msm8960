@@ -38,6 +38,9 @@
 #include <linux/wakelock.h>
 #include <linux/suspend.h>
 #include "wcd9310.h"
+#ifdef CONFIG_SND_SOC_ES325
+#include "es325-export.h"
+#endif
 
 static int cfilt_adjust_ms = 10;
 module_param(cfilt_adjust_ms, int, 0644);
@@ -4165,6 +4168,24 @@ static void tabla_codec_calibrate_hs_polling(struct snd_soc_codec *codec)
 		      n_cic[tabla_codec_mclk_index(tabla)]);
 }
 
+#ifdef CONFIG_SND_SOC_ES325
+static int tabla_startup(struct snd_pcm_substream *substream,
+		struct snd_soc_dai *dai)
+{
+	struct wcd9xxx *tabla_core = dev_get_drvdata(dai->codec->dev->parent);
+
+	pr_info("%s(): wrapper substream = %s  stream = %d id=%d\n" , __func__,
+		 substream->name, substream->stream, dai->id);
+	if ((tabla_core != NULL) &&
+	    (tabla_core->dev != NULL) &&
+	    (tabla_core->dev->parent != NULL)) {
+		pm_runtime_get_sync(tabla_core->dev->parent);
+		es325_wrapper_wakeup(dai);
+	}
+
+	return 0;
+}
+#else
 static int tabla_startup(struct snd_pcm_substream *substream,
 		struct snd_soc_dai *dai)
 {
@@ -4178,6 +4199,7 @@ static int tabla_startup(struct snd_pcm_substream *substream,
 
 	return 0;
 }
+#endif
 
 static void tabla_shutdown(struct snd_pcm_substream *substream,
 		struct snd_soc_dai *dai)
@@ -4203,6 +4225,9 @@ static void tabla_shutdown(struct snd_pcm_substream *substream,
 	    (tabla_core->dev != NULL) &&
 	    (tabla_core->dev->parent != NULL) &&
 	    (active == 0)) {
+#ifdef CONFIG_SND_SOC_ES325
+		es325_wrapper_sleep(dai->id);
+#endif
 		pm_runtime_mark_last_busy(tabla_core->dev->parent);
 		pm_runtime_put(tabla_core->dev->parent);
 	}
@@ -4766,6 +4791,92 @@ static int tabla_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+#ifdef CONFIG_SND_SOC_ES325
+static int tabla_es325_hw_params(struct snd_pcm_substream *substream,
+		struct snd_pcm_hw_params *params,
+		struct snd_soc_dai *dai)
+{
+	int rc = 0;
+	dev_dbg(dai->dev,"%s: dai_name = %s DAI-ID %x rate %d num_ch %d\n", __func__,
+			dai->name, dai->id, params_rate(params),
+			params_channels(params));
+
+	rc = tabla_hw_params(substream, params, dai);
+
+	if (es325_remote_route_enable(dai))
+		rc = es325_slim_hw_params(substream, params, dai);
+
+	return rc;
+}
+
+#define SLIM_BUGFIX
+static int tabla_es325_set_channel_map(struct snd_soc_dai *dai,
+				unsigned int tx_num, unsigned int *tx_slot,
+				unsigned int rx_num, unsigned int *rx_slot)
+
+{
+#if !defined(SLIM_BUGFIX)
+	unsigned int tabla_tx_num = 0;
+#endif
+	unsigned int tabla_tx_slot[6];
+#if !defined(SLIM_BUGFIX)
+	unsigned int tabla_rx_num = 0;
+#endif
+	unsigned int tabla_rx_slot[6];
+#if defined(SLIM_BUGFIX)
+	unsigned int temp_tx_num = 0;
+	unsigned int temp_rx_num = 0;
+#endif
+	int rc = 0;
+
+	if (es325_remote_route_enable(dai)) {
+#if defined(SLIM_BUGFIX)
+		rc = tabla_get_channel_map(dai, &temp_tx_num, tabla_tx_slot,
+					&temp_rx_num, tabla_rx_slot);
+#else
+		rc = tabla_get_channel_map(dai, &tabla_tx_num, tabla_tx_slot,
+					&tabla_rx_num, tabla_rx_slot);
+#endif
+
+		rc = tabla_set_channel_map(dai, tx_num, tabla_tx_slot, rx_num, tabla_rx_slot);
+
+        if(rc == 1) /* when codec do not set channel map, es325 also do not set */
+			return 0;
+
+		rc = es325_slim_set_channel_map(dai, tx_num, tx_slot, rx_num, rx_slot);
+	} else
+		rc = tabla_set_channel_map(dai, tx_num, tx_slot, rx_num, rx_slot);
+
+	return rc;
+}
+
+static int tabla_es325_get_channel_map(struct snd_soc_dai *dai,
+				unsigned int *tx_num, unsigned int *tx_slot,
+				unsigned int *rx_num, unsigned int *rx_slot)
+
+{
+	int rc = 0;
+
+	if (es325_remote_route_enable(dai))
+		rc = es325_slim_get_channel_map(dai, tx_num, tx_slot, rx_num, rx_slot);
+	else
+		rc = tabla_get_channel_map(dai, tx_num, tx_slot, rx_num, rx_slot);
+
+	return rc;
+}
+#endif
+
+#ifdef CONFIG_SND_SOC_ES325
+static struct snd_soc_dai_ops tabla_dai_ops = {
+	.startup = tabla_startup,
+	.shutdown = tabla_shutdown,
+	.hw_params = tabla_es325_hw_params, /* tabla_hw_params, */
+	.set_sysclk = tabla_set_dai_sysclk,
+	.set_fmt = tabla_set_dai_fmt,
+	.set_channel_map = tabla_es325_set_channel_map, /* tabla_set_channel_map, */
+	.get_channel_map = tabla_es325_get_channel_map, /* tabla_get_channel_map, */
+};
+#else
 static struct snd_soc_dai_ops tabla_dai_ops = {
 	.startup = tabla_startup,
 	.shutdown = tabla_shutdown,
@@ -4775,6 +4886,16 @@ static struct snd_soc_dai_ops tabla_dai_ops = {
 	.set_channel_map = tabla_set_channel_map,
 	.get_channel_map = tabla_get_channel_map,
 };
+#endif
+
+#ifdef CONFIG_SND_SOC_ES325
+static struct snd_soc_dai_ops tabla_es325_dai_ops = {
+	.startup = tabla_startup,
+	.hw_params = tabla_es325_hw_params,
+	.set_channel_map = tabla_es325_set_channel_map,
+	.get_channel_map = tabla_es325_get_channel_map,
+};
+#endif
 
 static struct snd_soc_dai_driver tabla_dai[] = {
 	{
@@ -4861,6 +4982,50 @@ static struct snd_soc_dai_driver tabla_dai[] = {
 		},
 		.ops = &tabla_dai_ops,
 	},
+#ifdef CONFIG_SND_SOC_ES325
+	{
+		.name = "tabla_es325_rx1",
+		.id = AIF1_PB + ES325_DAI_ID_OFFSET,
+		.playback = {
+			.stream_name = "AIF1 Playback",
+			.rates = WCD9310_RATES,
+			.formats = TABLA_FORMATS,
+			.rate_max = 192000,
+			.rate_min = 8000,
+			.channels_min = 1,
+			.channels_max = 2,
+		},
+		.ops = &tabla_es325_dai_ops,
+	},
+	{
+		.name = "tabla_es325_tx1",
+		.id = AIF1_CAP + ES325_DAI_ID_OFFSET,
+		.capture = {
+			.stream_name = "AIF1 Capture",
+			.rates = WCD9310_RATES,
+			.formats = TABLA_FORMATS,
+			.rate_max = 192000,
+			.rate_min = 8000,
+			.channels_min = 1,
+			.channels_max = 2,
+		},
+		.ops = &tabla_es325_dai_ops,
+	},
+	{
+		.name = "tabla_es325_rx2",
+		.id = AIF2_PB + ES325_DAI_ID_OFFSET,
+		.playback = {
+			.stream_name = "AIF2 Playback",
+			.rates = WCD9310_RATES,
+			.formats = TABLA_FORMATS,
+			.rate_max = 192000,
+			.rate_min = 8000,
+			.channels_min = 1,
+			.channels_max = 2,
+		},
+		.ops = &tabla_es325_dai_ops,
+	},
+#endif
 };
 
 static struct snd_soc_dai_driver tabla_i2s_dai[] = {
@@ -4970,6 +5135,9 @@ static int tabla_codec_enable_slimrx(struct snd_soc_dapm_widget *w,
 			ret = tabla_codec_enable_chmask(tabla_p,
 							SND_SOC_DAPM_POST_PMU,
 							j);
+#ifdef CONFIG_SND_SOC_ES325
+			ret = es325_remote_cfg_slim_rx(tabla_dai[j].id);
+#endif
 			ret = wcd9xxx_cfg_slim_sch_rx(tabla,
 					tabla_p->dai[j].ch_num,
 					tabla_p->dai[j].ch_tot,
@@ -4990,6 +5158,9 @@ static int tabla_codec_enable_slimrx(struct snd_soc_dapm_widget *w,
 			}
 		}
 		if (!tabla_p->dai[j].ch_act) {
+#ifdef CONFIG_SND_SOC_ES325
+			ret = es325_remote_close_slim_rx(tabla_dai[j].id);
+#endif
 			ret = wcd9xxx_close_slim_sch_rx(tabla,
 						tabla_p->dai[j].ch_num,
 						tabla_p->dai[j].ch_tot);
@@ -5012,6 +5183,9 @@ static int tabla_codec_enable_slimrx(struct snd_soc_dapm_widget *w,
 			if ((tabla != NULL) &&
 			    (tabla->dev != NULL) &&
 			    (tabla->dev->parent != NULL)) {
+#ifdef CONFIG_SND_SOC_ES325
+				es325_wrapper_sleep(j+1);
+#endif
 				pm_runtime_mark_last_busy(tabla->dev->parent);
 				pm_runtime_put(tabla->dev->parent);
 			}
@@ -5067,6 +5241,9 @@ static int tabla_codec_enable_slimtx(struct snd_soc_dapm_widget *w,
 						tabla_p->dai[j].ch_num,
 						tabla_p->dai[j].ch_tot,
 						tabla_p->dai[j].rate);
+#ifdef CONFIG_SND_SOC_ES325
+			ret = es325_remote_cfg_slim_tx(tabla_dai[j].id);
+#endif
 		}
 		break;
 	case SND_SOC_DAPM_POST_PMD:
@@ -5082,6 +5259,9 @@ static int tabla_codec_enable_slimtx(struct snd_soc_dapm_widget *w,
 			}
 		}
 		if (!tabla_p->dai[j].ch_act) {
+#ifdef CONFIG_SND_SOC_ES325
+			ret = es325_remote_close_slim_tx(tabla_dai[j].id);
+#endif
 			ret = wcd9xxx_close_slim_sch_tx(tabla,
 						tabla_p->dai[j].ch_num,
 						tabla_p->dai[j].ch_tot);
@@ -5103,6 +5283,9 @@ static int tabla_codec_enable_slimtx(struct snd_soc_dapm_widget *w,
 			if ((tabla != NULL) &&
 			    (tabla->dev != NULL) &&
 			    (tabla->dev->parent != NULL)) {
+#ifdef CONFIG_SND_SOC_ES325
+				es325_wrapper_sleep(j+1);
+#endif
 				pm_runtime_mark_last_busy(tabla->dev->parent);
 				pm_runtime_put(tabla->dev->parent);
 			}
@@ -8586,6 +8769,9 @@ static int tabla_codec_probe(struct snd_soc_codec *codec)
 		goto err_pdata;
 	}
 
+#ifdef CONFIG_SND_SOC_ES325
+	es325_remote_add_codec_controls(codec);
+#endif
 //	snd_soc_add_codec_controls(codec, tabla_snd_controls,
 //			     ARRAY_SIZE(tabla_snd_controls));
 	if (TABLA_IS_1_X(control->version))
